@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# CONFIG (tune if you want)
+# CONFIG 
 # ============================================================
 ROOT = Path("JSON")
 OUTDIR = Path("angles_output")
