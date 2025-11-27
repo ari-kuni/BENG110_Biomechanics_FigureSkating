@@ -1,0 +1,219 @@
+import json
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+# ============================================================
+# CONFIG
+# ============================================================
+ROOT = Path(__file__).resolve().parent
+JSON_ROOT = ROOT / "JSON"
+
+SKATERS = ["Skater_A", "Skater_B", "Skater_C", "Skater_D"]
+JUMPS = ["Axel", "Flip", "Loop", "Lutz", "Salchow", "Toeloop"]
+
+MASS_KG = 55.0          # <-- change if you want per-skater mass later
+G = 9.81
+
+# landing/settle detection tuning
+VEL_SMOOTH_WINDOW = 5   # frames for smoothing vz
+SETTLE_VEL_THRESH = 0.3 # m/s, "settled" when |vz| below this
+SETTLE_CONSEC = 10      # consecutive frames below thresh
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+def load_json(path: Path):
+    with open(path, "r") as f:
+        return json.load(f)
+
+def marker_to_array(marker_dict, num_frames, global_start):
+    """
+    Returns (num_frames, 3) array in METERS.
+    Marker format (from your example):
+        marker["Parts"][0]["Range"]["Start/End"]
+        marker["Parts"][0]["Values"] = [[x,y,z,0], ...]
+    """
+    arr = np.full((num_frames, 3), np.nan, dtype=float)
+
+    if "Parts" not in marker_dict or len(marker_dict["Parts"]) == 0:
+        return arr
+
+    part0 = marker_dict["Parts"][0]
+    values = part0.get("Values", [])
+    r = part0.get("Range", None)
+    if r is None:
+        return arr
+
+    start = int(r["Start"])
+    end = int(r["End"])
+    # values length should be (end-start+1)
+    vals = np.array(values, dtype=float)
+
+    # keep xyz only, convert mm -> m
+    xyz = vals[:, :3] / 1000.0
+
+    # place into global frame index
+    i0 = start - global_start
+    i1 = end - global_start + 1
+    arr[i0:i1, :] = xyz[: (i1 - i0), :]
+
+    return arr
+
+def build_pose(markers):
+    """
+    Build pose array (frames, markers, 3) in meters.
+    Global timebase comes from marker[0]["Timebase"]["Range"].
+    """
+    # Find global start/end from first marker that has Parts
+    global_start = None
+    global_end = None
+    fs = None
+
+    for m in markers:
+        if "Timebase" in m and "Range" in m["Timebase"]:
+            tb = m["Timebase"]
+            global_start = int(tb["Range"]["Start"])
+            global_end = int(tb["Range"]["End"])
+            fs = float(tb.get("Frequency", 60.0))
+            break
+
+    if global_start is None or global_end is None:
+        raise ValueError("Could not find global Timebase Range.")
+
+    num_frames = global_end - global_start + 1
+    num_markers = len(markers)
+
+    pose = np.full((num_frames, num_markers, 3), np.nan, dtype=float)
+    marker_names = []
+
+    for i, m in enumerate(markers):
+        marker_names.append(m.get("Name", f"M{i}"))
+        pose[:, i, :] = marker_to_array(m, num_frames, global_start)
+
+    return pose, marker_names, fs, global_start, global_end
+
+def smooth(x, w=5):
+    if w <= 1:
+        return x
+    k = np.ones(w) / w
+    return np.convolve(x, k, mode="same")
+
+def detect_landing_and_settle(vz, fs):
+    """
+    Landing = most negative vz (impact moment approximation).
+    Settle = first point after landing where |vz|<thresh for N frames.
+    """
+    landing_idx = int(np.argmin(vz))  # most negative
+
+    # search for settle
+    settle_idx = None
+    for i in range(landing_idx + 1, len(vz) - SETTLE_CONSEC):
+        window = vz[i:i+SETTLE_CONSEC]
+        if np.all(np.abs(window) < SETTLE_VEL_THRESH):
+            settle_idx = i
+            break
+
+    if settle_idx is None:
+        decel_time = np.nan
+    else:
+        decel_time = (settle_idx - landing_idx) / fs
+
+    return landing_idx, settle_idx, decel_time
+
+def process_trial(json_file: Path, mass_kg=MASS_KG):
+    data = load_json(json_file)
+    markers = data.get("Markers", [])
+    if len(markers) == 0:
+        raise ValueError("No markers found.")
+
+    pose, names, fs, start_frame, end_frame = build_pose(markers)
+
+    # COM: average all marker positions
+    COM = np.nanmean(pose, axis=1)  # (frames, 3)
+
+    # vertical velocity (z)
+    dt = 1.0 / fs
+    vz = np.gradient(COM[:, 2], dt)
+    vz = smooth(vz, VEL_SMOOTH_WINDOW)
+
+    landing_idx, settle_idx, decel_time = detect_landing_and_settle(vz, fs)
+    v_impact = -vz[landing_idx]  # positive number
+
+    if np.isfinite(decel_time) and decel_time > 0:
+        F_peak = mass_kg * v_impact / decel_time + mass_kg * G
+        BW = F_peak / (mass_kg * G)
+    else:
+        F_peak = np.nan
+        BW = np.nan
+
+    return {
+        "fs_Hz": fs,
+        "start_frame": start_frame,
+        "end_frame": end_frame,
+        "landing_frame_idx": landing_idx,
+        "landing_frame_number": start_frame + landing_idx,
+        "v_landing_mps": -v_impact,   # keep sign like your CSV
+        "settle_frame_idx": settle_idx,
+        "decel_time_s": decel_time,
+        "F_peak_N": F_peak,
+        "F_peak_BW": BW
+    }
+
+# ============================================================
+# MAIN BATCH LOOP (ALL VIDEOS)
+# ============================================================
+def main():
+    rows = []
+
+    for skater in SKATERS:
+        for jump in JUMPS:
+            jump_dir = JSON_ROOT / skater / jump
+            if not jump_dir.exists():
+                continue
+
+            # grab every json in this jump folder
+            files = sorted(jump_dir.glob("*.json"))
+
+            for jf in files:
+                trial_name = jf.stem  # e.g., Flip_1, Flip_2, ...
+
+                try:
+                    metrics = process_trial(jf, mass_kg=MASS_KG)
+                    status = "ok"
+                except Exception as e:
+                    metrics = {
+                        "fs_Hz": np.nan,
+                        "start_frame": np.nan,
+                        "end_frame": np.nan,
+                        "landing_frame_idx": np.nan,
+                        "landing_frame_number": np.nan,
+                        "v_landing_mps": np.nan,
+                        "settle_frame_idx": np.nan,
+                        "decel_time_s": np.nan,
+                        "F_peak_N": np.nan,
+                        "F_peak_BW": np.nan
+                    }
+                    status = f"error: {type(e).__name__}"
+
+                rows.append({
+                    "skater": skater,
+                    "jump_type": jump,
+                    "trial": trial_name,
+                    "file": str(jf),
+                    **metrics,
+                    "status": status
+                })
+
+    df = pd.DataFrame(rows)
+
+    out_csv = ROOT / "summary_all_trials.csv"
+    df.to_csv(out_csv, index=False)
+
+    print("\n✅ DONE")
+    print("Saved:", out_csv)
+    print(df.head(10))
+
+if __name__ == "__main__":
+    main()
