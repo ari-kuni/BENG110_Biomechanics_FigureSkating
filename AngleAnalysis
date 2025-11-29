@@ -4,11 +4,14 @@ import numpy as np
 import pandas as pd
 
 # ============================================================
-# CONFIG 
+# CONFIG
 # ============================================================
-ROOT = Path("JSON")
+ROOT = Path("JSON")          # root folder with Skater_A, Skater_B, ...
 OUTDIR = Path("angles_output")
 OUTDIR.mkdir(exist_ok=True)
+
+MASS_KG = 55.0               # assumed skater mass (can change per-skater later)
+G = 9.81                     # m/s^2
 
 # landing/settle detection tuning
 VEL_SMOOTH_WINDOW = 5     # frames for smoothing vz
@@ -52,10 +55,8 @@ def angle_ABC(A, B, C):
     """
     BA = A - B
     BC = C - B
-    # norms
     ba_n = np.linalg.norm(BA, axis=1)
     bc_n = np.linalg.norm(BC, axis=1)
-    # avoid divide by zero
     denom = ba_n * bc_n
     denom[denom == 0] = np.nan
     cosang = np.sum(BA * BC, axis=1) / denom
@@ -85,21 +86,18 @@ def estimate_pelvis_z(j):
     if arr is not None:
         return arr[:, 2], arr.shape[0]
 
-    # average hips
     lh = get_marker_array(j, "LHIP")
     rh = get_marker_array(j, "RHIP")
     if lh is not None and rh is not None:
         z = 0.5 * (lh[:, 2] + rh[:, 2])
         return z, lh.shape[0]
 
-    # average ASIS
     la = get_marker_array(j, "LASI")
     ra = get_marker_array(j, "RASI")
     if la is not None and ra is not None:
         z = 0.5 * (la[:, 2] + ra[:, 2])
         return z, la.shape[0]
 
-    # last resort: any marker
     all_names = list_marker_names(j)
     if not all_names:
         return None, 0
@@ -117,12 +115,11 @@ def detect_landing_mask(j):
 
     t, dt, freq = compute_timebase(j, n_frames)
 
-    vz = np.gradient(pelvis_z, dt)  # m/s if z is meters
+    vz = np.gradient(pelvis_z, dt)
     vz_s = smooth(vz, VEL_SMOOTH_WINDOW)
 
-    impact_idx = int(np.nanargmin(vz_s))  # most negative velocity
+    impact_idx = int(np.nanargmin(vz_s))
 
-    # find settle start after impact
     abs_v = np.abs(vz_s)
     settle_idx = None
     for i in range(impact_idx, n_frames - SETTLE_CONSEC):
@@ -137,10 +134,37 @@ def detect_landing_mask(j):
     mask[impact_idx:settle_idx+1] = True
     return mask, impact_idx, settle_idx
 
+def compute_landing_F_peak(j, impact_idx, settle_idx):
+    """
+    Estimate peak vertical GRF (F_peak) using impulse-momentum:
+
+        F_peak = m * (|v_impact| / t_decel) + m*g
+
+    where v_impact is vertical COM velocity at impact and t_decel is
+    time from impact to settle.
+    """
+    pelvis_z, n_frames = estimate_pelvis_z(j)
+    if pelvis_z is None or n_frames == 0:
+        return np.nan, np.nan, np.nan
+
+    t, dt, freq = compute_timebase(j, n_frames)
+
+    vz = np.gradient(pelvis_z, dt)
+    vz_s = smooth(vz, VEL_SMOOTH_WINDOW)
+
+    v_impact = vz_s[impact_idx]             # m/s (negative = downward)
+    t_decel = (settle_idx - impact_idx) * dt
+
+    if t_decel <= 0:
+        return v_impact, t_decel, np.nan
+
+    F_peak = MASS_KG * (abs(v_impact) / t_decel) + MASS_KG * G  # Newtons
+    return v_impact, t_decel, F_peak
+
 def compute_lower_body_angles(j):
     """
-    Auto-find markers and compute angles + ang vel/acc.
-    Returns DataFrame with full-frame angles (not yet filtered).
+    Auto-find markers and compute KNEE + ANKLE angles, vel, accel for all frames.
+    Returns DataFrame with full-frame data and raw marker arrays for ankle/toe.
     """
     # ----- choose side: prefer Right, else Left -----
     hip_candidates_R = ["RHIP", "R_Hip Joint", "R_HIP"]
@@ -160,7 +184,6 @@ def compute_lower_body_angles(j):
 
     side = "R"
     if any(x is None for x in [hip, knee, ankle]):
-        # fallback to left
         hip_nm, hip = get_first_existing_marker(j, hip_candidates_L)
         knee_nm, knee = get_first_existing_marker(j, knee_candidates_L)
         ankle_nm, ankle = get_first_existing_marker(j, ankle_candidates_L)
@@ -168,42 +191,31 @@ def compute_lower_body_angles(j):
         side = "L"
 
     if hip is None or knee is None or ankle is None:
-        raise ValueError(f"Missing required lower-body markers (hip/knee/ankle). Found: hip={hip_nm}, knee={knee_nm}, ankle={ankle_nm}")
+        raise ValueError(
+            f"Missing required lower-body markers (hip/knee/ankle). "
+            f"Found: hip={hip_nm}, knee={knee_nm}, ankle={ankle_nm}"
+        )
 
     n_frames = hip.shape[0]
     t, dt, freq = compute_timebase(j, n_frames)
 
-    # trunk marker for hip angle (proximal point)
-    trunk_candidates = ["C7", "CLAV", "Manubrium", "STERN", "C_ASIS", "PELVIS"]
-    trunk_nm, trunk = get_first_existing_marker(j, trunk_candidates)
-    if trunk is None:
-        # hip angle fallback: use pelvis centroid from ASIS if possible
-        z, _ = estimate_pelvis_z(j)
-        trunk = hip.copy()
-        trunk[:, 2] = z
-        trunk_nm = "pelvis_fallback"
-
-    # if toe missing, use ankle->foot direction via MT5 / heel etc.
+    # handle missing toe marker
     if toe is None:
-        foot_candidates = (["RHEL","R_HEEL","RTOE","RMT5"] if side=="R"
-                           else ["LHEL","L_HEEL","LTOE","LMT5"])
+        foot_candidates = (["RHEL", "R_HEEL", "RTOE", "RMT5"] if side == "R"
+                           else ["LHEL", "L_HEEL", "LTOE", "LMT5"])
         toe_nm, toe = get_first_existing_marker(j, foot_candidates)
     if toe is None:
-        # last resort: set toe = ankle + small forward vector so ankle angle doesn't crash
         toe = ankle + np.array([0.01, 0.0, 0.0])
         toe_nm = "toe_fallback"
 
     # ----- angles -----
-    hip_angle = angle_ABC(trunk, hip, knee)
     knee_angle = angle_ABC(hip, knee, ankle)
     ankle_angle = angle_ABC(knee, ankle, toe)
 
     # ----- angular velocity + acceleration -----
-    hip_w = np.gradient(hip_angle, dt)     # deg/s
     knee_w = np.gradient(knee_angle, dt)
     ankle_w = np.gradient(ankle_angle, dt)
 
-    hip_alpha = np.gradient(hip_w, dt)     # deg/s^2
     knee_alpha = np.gradient(knee_w, dt)
     ankle_alpha = np.gradient(ankle_w, dt)
 
@@ -216,53 +228,108 @@ def compute_lower_body_angles(j):
         "knee_marker": knee_nm,
         "ankle_marker": ankle_nm,
         "toe_marker": toe_nm,
-        "trunk_marker": trunk_nm,
 
-        "hip_angle_deg": hip_angle,
         "knee_angle_deg": knee_angle,
         "ankle_angle_deg": ankle_angle,
 
-        "hip_ang_vel_deg_s": hip_w,
         "knee_ang_vel_deg_s": knee_w,
         "ankle_ang_vel_deg_s": ankle_w,
 
-        "hip_ang_accel_deg_s2": hip_alpha,
         "knee_ang_accel_deg_s2": knee_alpha,
         "ankle_ang_accel_deg_s2": ankle_alpha,
     })
-    return df
+
+    # return marker arrays as well so we can get moment arm at impact
+    return df, ankle, toe
 
 def process_one_json(json_path: Path):
+    """
+    Return a ONE-ROW DataFrame with knee/ankle kinematics, F_peak, and ankle moment
+    at the impact frame. If something fails, still return a row with NaNs + status.
+    """
     j = load_json(json_path)
 
-    # compute full angles
-    full_df = compute_lower_body_angles(j)
+    base_row = {
+        "frame": np.nan,
+        "time_s": np.nan,
+        "side_used": "",
+        "hip_marker": "",
+        "knee_marker": "",
+        "ankle_marker": "",
+        "toe_marker": "",
+        "knee_angle_deg": np.nan,
+        "ankle_angle_deg": np.nan,
+        "knee_ang_vel_deg_s": np.nan,
+        "ankle_ang_vel_deg_s": np.nan,
+        "knee_ang_accel_deg_s2": np.nan,
+        "ankle_ang_accel_deg_s2": np.nan,
+        "impact_frame": np.nan,
+        "settle_frame": np.nan,
+        "decel_duration_s": np.nan,
+        "landing_frame_rel": np.nan,
+        "v_impact_m_s": np.nan,
+        "F_peak_N": np.nan,
+        "ankle_moment_Nm": np.nan,
+        "status": "ok",
+    }
 
-    # landing mask
+    try:
+        full_df, ankle_xyz, toe_xyz = compute_lower_body_angles(j)
+    except Exception as e:
+        base_row["status"] = f"angle_fail: {e}"
+        return pd.DataFrame([base_row])
+
     mask, impact_idx, settle_idx = detect_landing_mask(j)
-    if mask is None:
-        # if landing detection fails, just return empty
-        return pd.DataFrame()
+    if mask is None or impact_idx is None:
+        base_row["status"] = "landing_detection_fail"
+        return pd.DataFrame([base_row])
 
-    land_df = full_df.loc[mask].copy()
-    land_df["impact_frame"] = impact_idx
-    land_df["settle_frame"] = settle_idx
-    land_df["landing_frame_rel"] = land_df["frame"] - impact_idx
-    return land_df
+    # landing kinematics & F_peak
+    v_impact, t_decel, F_peak = compute_landing_F_peak(j, impact_idx, settle_idx)
+
+    # ankle moment:
+    #   M_ankle = F_peak * r
+    #   where r = horizontal distance ankle -> toe in the ice plane
+    ankle_pt = ankle_xyz[impact_idx]
+    toe_pt = toe_xyz[impact_idx]
+    foot_vec = toe_pt - ankle_pt
+    # horizontal distance in X-Y plane (assumes ice ~ horizontal)
+    r = np.linalg.norm(foot_vec[:2])
+    if np.isnan(F_peak) or np.isnan(r):
+        ankle_moment = np.nan
+    else:
+        ankle_moment = F_peak * r  # N*m
+
+    n_frames = len(full_df)
+    _, dt, _ = compute_timebase(j, n_frames)
+
+    row = full_df.loc[impact_idx].to_dict()
+    row.update({
+        "impact_frame": impact_idx,
+        "settle_frame": settle_idx,
+        "decel_duration_s": t_decel,
+        "landing_frame_rel": 0,
+        "v_impact_m_s": v_impact,
+        "F_peak_N": F_peak,
+        "ankle_moment_Nm": ankle_moment,
+        "status": "ok",
+    })
+
+    return pd.DataFrame([row])
 
 # ============================================================
-# MAIN: all trials -> ONE CSV per skater
+# MAIN: all trials -> ONE CSV for ALL SKATERS
 # ============================================================
 def main():
     if not ROOT.exists():
         raise FileNotFoundError("JSON folder not found. Run from FSJ_Project root.")
 
+    all_rows = []
+
     for skater_dir in sorted(ROOT.iterdir()):
         if not skater_dir.is_dir():
             continue
-
         skater_name = skater_dir.name
-        all_rows = []
 
         for jump_dir in sorted(skater_dir.iterdir()):
             if not jump_dir.is_dir():
@@ -271,27 +338,23 @@ def main():
 
             for jf in sorted(jump_dir.glob("*.json")):
                 trial_stem = jf.stem  # e.g., Axel_4
-                try:
-                    land_df = process_one_json(jf)
-                    if land_df.empty:
-                        continue
+                land_df = process_one_json(jf)
 
-                    land_df.insert(0, "skater", skater_name)
-                    land_df.insert(1, "jump", jump_name)
-                    land_df.insert(2, "trial", trial_stem)
+                land_df.insert(0, "skater", skater_name)
+                land_df.insert(1, "jump", jump_name)
+                land_df.insert(2, "trial", trial_stem)
 
-                    all_rows.append(land_df)
+                all_rows.append(land_df)
 
-                except Exception as e:
-                    print(f"Error in {jf}: {e}")
-
-        if all_rows:
-            out_df = pd.concat(all_rows, ignore_index=True)
-            out_csv = OUTDIR / f"{skater_name}_landing_lower_body_angles.csv"
-            out_df.to_csv(out_csv, index=False)
-            print(f"Saved {out_csv} ({len(out_df)} landing frames)")
-        else:
-            print(f"No landing data found for {skater_name}")
+    if all_rows:
+        out_df = pd.concat(all_rows, ignore_index=True)
+        out_csv = OUTDIR / "all_skaters_landing_lower_body_angles.csv"
+        out_df.to_csv(out_csv, index=False)
+        print(f"Saved {out_csv} ({len(out_df)} rows)")
+        print("Status counts:\n", out_df["status"].value_counts())
+    else:
+        print("No JSON files found")
 
 if __name__ == "__main__":
     main()
+
